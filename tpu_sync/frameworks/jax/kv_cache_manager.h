@@ -171,6 +171,8 @@ class NumaAwareKVCacheManager {
   CompleteReadRaw();
 
   absl::Status UnlockBlocks(const std::vector<int>& block_ids);
+  absl::StatusOr<std::vector<int>> AllocateBlocks(int num_blocks);
+  absl::Status DeallocateBlocks(const std::vector<int>& block_ids);
 
   void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {
     for (auto& sub_manager : sub_managers_) {
@@ -197,6 +199,13 @@ class NumaAwareKVCacheManager {
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
+
+#ifndef WITHOUT_PYTHON
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& host_block_ids, bool device_to_host,
+      bool unsafe_skip_buffer_lock = false);
+#endif
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},
@@ -465,6 +474,14 @@ class KVCacheManager {
     return numa_manager_->UnlockBlocks(block_ids);
   }
 
+  absl::StatusOr<std::vector<int>> AllocateBlocks(int num_blocks) {
+    return numa_manager_->AllocateBlocks(num_blocks);
+  }
+
+  absl::Status DeallocateBlocks(const std::vector<int>& block_ids) {
+    return numa_manager_->DeallocateBlocks(block_ids);
+  }
+
   std::string DumpMetricsToString() const {
     return numa_manager_->DumpMetricsToString();
   }
@@ -492,6 +509,16 @@ class KVCacheManager {
                               copy_sizes_major_dim, slot_idx, layer_idx,
                               shard_idx);
   }
+
+#ifndef WITHOUT_PYTHON
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& host_block_ids, bool device_to_host,
+      bool unsafe_skip_buffer_lock = false) {
+    return numa_manager_->CopyPacked(packed_array, host_block_ids,
+                                     device_to_host, unsafe_skip_buffer_lock);
+  }
+#endif
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},

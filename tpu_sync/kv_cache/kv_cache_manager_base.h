@@ -536,6 +536,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return host_block_manager_.get();
   }
 
+  // Deallocates `block_ids` back to the free pool in LogicalBlockManager.
+  absl::Status DeallocateHostBlocks(absl::Span<const int> block_ids);
+
   // BlockTransport's wire index addresses pools after explicit admission and
   // constructor storages otherwise.
   size_t num_block_arrays() const override;
@@ -738,6 +741,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
+
+  // Bulk D2H (`device_to_host=true`) or H2D (`device_to_host=false`) on a
+  // pre-packed device buffer `[0..host_block_ids.size())[0..num_layers_)` (one
+  // handle per shard; axis 0 may be over-provisioned for static bucketing).
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPackedDeviceBuffer(
+      absl::Span<const raiden::RaidenBufferHandle> packed_shards,
+      absl::Span<const int64_t> host_block_ids, bool device_to_host);
 
   // Per-layer device buffer holds bundled with the layer's on-device size.
   // For uniform models every layer has the same physical_size; for hybrid
@@ -971,7 +981,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<const PoolStagingLease> PoolStagingLeaseSnapshot(
       size_t storage_idx, uint64_t uuid) const;
 
+  struct HostBouncePool;
   HostBufferAllocator host_allocator_ = nullptr;
+  std::shared_ptr<HostBouncePool> bounce_pool_;
+  std::shared_ptr<HostBouncePool> EnsureBouncePool();
 
   absl::StatusOr<std::shared_ptr<const TransferPlan>> GetTransferPlan(
       uint64_t uuid) const;
