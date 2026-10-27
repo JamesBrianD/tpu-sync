@@ -390,12 +390,18 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     return grpc::Status::OK;
   }
 
+  const std::string backend_name = spec.name();
+  // Same exception as RaidenController::BuildTransferBackendBuffersRequest:
+  // only the "tds" backend may omit host_block_ids, and only entirely.
+  const bool allow_empty_host_ids = (backend_name == "tds");
+
   // block_hashes, hbm_block_ids and host_block_ids are parallel by contract;
-  // entry i describes exactly one block. The equivalent check used to live in
-  // RaidenController::BuildTransferBuffersRequest, which this RPC bypasses
-  // entirely, so it is enforced server-side here instead.
+  // entry i describes exactly one block. For TDS direct HBM <-> Storage
+  // transfers, host_block_ids may be empty: no host DRAM staging block exists,
+  // and an empty list is what selects the direct route below.
   if (request->hbm_block_ids_size() != num_blocks ||
-      request->host_block_ids_size() != num_blocks) {
+      (request->host_block_ids_size() != num_blocks &&
+       !(allow_empty_host_ids && request->host_block_ids().empty()))) {
     LOG(ERROR) << "[Worker] Block id count mismatch: hbm_block_ids ("
                << request->hbm_block_ids_size() << "), host_block_ids ("
                << request->host_block_ids_size() << "), block_hashes ("
@@ -410,7 +416,6 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     return grpc::Status::OK;
   }
 
-  const std::string backend_name = spec.name();
   std::shared_ptr<kv_cache::backends::KVBackend> driver =
       transfer_manager_.GetKVBackend(backend_name);
   if (!driver) {

@@ -1087,6 +1087,16 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   push_pool_.reset();
   dma_pool_.reset();
   pull_pool_.reset();
+  {
+    // Drain and destroy secondary backends (e.g. TdsKVBackend::poller_thread_)
+    // outside `backends_mu_` BEFORE `buffer_holds_.clear()` unpins device HBM.
+    absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>
+        backends_to_destroy;
+    {
+      absl::MutexLock lock(backends_mu_);
+      backends_to_destroy = std::move(backends_);
+    }
+  }
   buffer_holds_.clear();
   layers_ = StagingArena();
   host_block_manager_.reset();

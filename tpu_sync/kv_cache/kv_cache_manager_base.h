@@ -744,6 +744,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // (HMA) models sizes may differ (e.g. mamba conv_state bf16 vs ssm f32).
   struct LayerDeviceInfo {
     std::vector<raiden::BufferHoldAndAlias> holds;
+    // Per-shard PJRT external DMA handles populated once at backend startup
+    // (`RegisterDeviceBuffersWithTds`) and read lock-free during transfers.
+    // Empty unless every buffer succeeded startup BAR2 registration.
+    std::vector<std::shared_ptr<const raiden::ExternalDmaInfo>>
+        external_dma_infos;
     // Total on-device bytes for this layer's buffer.  Set by the
     // device-backed constructor from PjRtBuffer.  DMA functions use
     // this for per-layer offset and copy-size calculations.
