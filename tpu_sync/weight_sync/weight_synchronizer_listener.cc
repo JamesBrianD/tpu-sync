@@ -389,6 +389,8 @@ WeightSynchronizerListener::WeightSynchronizerListener(
                   cfg.max_frame_bytes);
   RegisterHandler(&WeightSynchronizerListener::HandleStartWeightPush,
                   cfg.max_frame_bytes);
+  RegisterHandler(&WeightSynchronizerListener::HandleAwaitWeightReceive,
+                  cfg.max_frame_bytes);
 
   if (pipe_server_->backend_type() == ControlPipeBackendType::kGrpc) {
     CHECK_OK(
@@ -689,6 +691,36 @@ WeightSynchronizerListener::HandleStartWeightPush(
   *push.mutable_peer_control_endpoints() = coordinated.peer_control_endpoints();
   ABSL_RETURN_IF_ERROR(engine_->PushWeightsResharded(push));
   return ::tpu_sync::rpc::StartWeightPushResponse();
+}
+
+absl::StatusOr<::tpu_sync::rpc::AwaitWeightReceiveResponse>
+WeightSynchronizerListener::HandleAwaitWeightReceive(
+    const ::tpu_sync::rpc::AwaitWeightReceiveRequest& req) {
+  if (stopping_.load()) {
+    return absl::UnavailableError(kStoppingMessage);
+  }
+  ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(
+      *engine_, "AwaitWeightReceive", req.uuid(), req.target_incarnation_id()));
+  if (req.uuid() <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "AwaitWeightReceive requires a positive uuid; got ", req.uuid()));
+  }
+  const std::string await_name =
+      absl::StrCat("AwaitWeightReceive (uuid=", req.uuid(), ")");
+  ABSL_ASSIGN_OR_RETURN(
+      const WeightVersion version,
+      WeightVersion::FromProto(req.version(),
+                               absl::StrCat(await_name, " version")));
+  if (req.timeout_ms() <= 0 ||
+      absl::Milliseconds(req.timeout_ms()) > kMaxTransferTimeout) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(await_name, " timeout_ms must be in (0, ",
+                     absl::FormatDuration(kMaxTransferTimeout), "]; got ",
+                     req.timeout_ms()));
+  }
+  return absl::UnimplementedError(
+      absl::StrCat(await_name, " for ", version,
+                   ": awaiting a receive's commit is not implemented yet"));
 }
 
 }  // namespace weight_sync
