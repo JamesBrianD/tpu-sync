@@ -126,24 +126,28 @@ absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
 
 template <typename Fn>
 absl::Status ForEachPayload(MajorOrder major_order,
-                            const std::vector<int>& layer_ids,
-                            absl::Span<const int> shard_ids, size_t num_blocks,
-                            Fn fn) {
+                            absl::Span<const int> major_dimension_indices,
+                            absl::Span<const int> shard_ids,
+                            size_t num_minor_dimension_size, Fn fn) {
   switch (static_cast<int>(major_order)) {
     case static_cast<int>(MajorOrder::kLayerMajor):
-      for (int l : layer_ids) {
+      for (int major_idx : major_dimension_indices) {
         for (int sh : shard_ids) {
-          for (size_t k = 0; k < num_blocks; ++k) {
-            ABSL_RETURN_IF_ERROR(fn(l, static_cast<size_t>(sh), k));
+          for (size_t minor_idx = 0; minor_idx < num_minor_dimension_size;
+               ++minor_idx) {
+            ABSL_RETURN_IF_ERROR(fn(static_cast<size_t>(major_idx),
+                                    static_cast<size_t>(sh), minor_idx));
           }
         }
       }
       return absl::OkStatus();
     case static_cast<int>(MajorOrder::kBlockMajor):
-      for (size_t k = 0; k < num_blocks; ++k) {
-        for (int l : layer_ids) {
-          for (int sh : shard_ids) {
-            ABSL_RETURN_IF_ERROR(fn(l, static_cast<size_t>(sh), k));
+      for (int major_idx : major_dimension_indices) {
+        for (int sh : shard_ids) {
+          for (size_t minor_idx = 0; minor_idx < num_minor_dimension_size;
+               ++minor_idx) {
+            ABSL_RETURN_IF_ERROR(fn(minor_idx, static_cast<size_t>(sh),
+                                    static_cast<size_t>(major_idx)));
           }
         }
       }
@@ -179,23 +183,24 @@ absl::StatusOr<std::vector<int>> ShardsFromMask(uint16_t mask,
 
 struct IncomingPushSpec {
   std::optional<PoolPushProgressSpec> pool_progress_spec;
-  std::vector<int> target_layers;
+  std::vector<int> target_major_dimension_indices;
 };
 
 absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
     BlockTransportDelegate* delegate, uint32_t local_id,
     bool is_explicit_dst_push, uint64_t uuid) {
-  std::vector<int> target_layers;
+  std::vector<int> target_major_dimension_indices;
   if (local_id == lib::kUnspecifiedLocalId) {
-    target_layers.resize(delegate->num_block_arrays());
-    std::iota(target_layers.begin(), target_layers.end(), 0);
+    target_major_dimension_indices.resize(delegate->num_block_arrays());
+    std::iota(target_major_dimension_indices.begin(),
+              target_major_dimension_indices.end(), 0);
   } else {
     if (local_id >= delegate->num_block_arrays()) {
       return absl::OutOfRangeError(
           absl::StrCat("push block-array index ", local_id,
                        " out of range: ", delegate->num_block_arrays()));
     }
-    target_layers = {static_cast<int>(local_id)};
+    target_major_dimension_indices = {static_cast<int>(local_id)};
   }
 
   // Resolve the expectation source before the explicit-destination handshake
@@ -204,7 +209,7 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
   // completion gate is the plan's global push count. nullopt keeps the
   // header-declared (legacy) contract.
   std::optional<PoolPushProgressSpec> pool_progress_spec;
-  for (int target_layer : target_layers) {
+  for (int target_layer : target_major_dimension_indices) {
     ABSL_ASSIGN_OR_RETURN(
         std::optional<PoolPushProgressSpec> candidate,
         delegate->GetPoolPushProgressSpec(target_layer, uuid));
@@ -215,7 +220,7 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
       }
       continue;
     }
-    if (target_layers.size() != 1) {
+    if (target_major_dimension_indices.size() != 1) {
       return absl::InvalidArgumentError(
           "pool-keyed push must address exactly one transfer pool");
     }
@@ -235,7 +240,8 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
 
   return IncomingPushSpec{
       .pool_progress_spec = pool_progress_spec,
-      .target_layers = std::move(target_layers),
+      .target_major_dimension_indices =
+          std::move(target_major_dimension_indices),
   };
 }
 
@@ -423,13 +429,29 @@ absl::Status BlockTransportServerPushSession::StartStream(
   // fault injection hook fires once per push, right before the middle chunk,
   // so an injected failure or latency hits mid-transfer: half of the payload
   // has already been received and the rest is still in flight.
-  const size_t fault_injection_payload_index = push_spec.target_layers.size() *
-                                               stream_shards.size() *
-                                               header.count_or_size / 2;
+  const size_t fault_injection_payload_index =
+      push_spec.target_major_dimension_indices.size() * stream_shards.size() *
+      header.count_or_size / 2;
   size_t payload_index = 0;
+  const bool is_block_major = major_order == MajorOrder::kBlockMajor;
+  std::vector<int> block_indices;
+  absl::Span<const int> major_indices =
+      push_spec.target_major_dimension_indices;
+  size_t minor_size = header.count_or_size;
+  if (is_block_major) {
+    block_indices.resize(header.count_or_size);
+    std::iota(block_indices.begin(), block_indices.end(), 0);
+    major_indices = block_indices;
+    minor_size = push_spec.target_major_dimension_indices.size();
+  }
   ABSL_RETURN_IF_ERROR(ForEachPayload(
-      major_order, push_spec.target_layers, stream_shards, header.count_or_size,
-      [&](size_t l, size_t sh, size_t k) -> absl::Status {
+      major_order, major_indices, stream_shards, minor_size,
+      [&](size_t l_idx, size_t sh, size_t k) -> absl::Status {
+        const size_t l =
+            is_block_major
+                ? static_cast<size_t>(
+                      push_spec.target_major_dimension_indices[l_idx])
+                : l_idx;
         ABSL_DCHECK_LT(k, allocated_ids.size());
         const int dst_id = allocated_ids[k];
         if (payload_index++ == fault_injection_payload_index) {
@@ -713,7 +735,8 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
 }
 
 size_t BlockTransportServerPushSession::AccumulateLandedShards(
-    LayerProgress::SenderStreams& streams, size_t shards, size_t full_shards) {
+    MajorDimensionProgress::SenderStreams& streams, size_t shards,
+    size_t full_shards) {
   streams.landed_shards += shards == 0 ? full_shards : shards;
   const size_t pushes = streams.landed_shards / full_shards;
   streams.landed += pushes;
@@ -731,9 +754,9 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   // differ. Plan-declared mode counts every sender's streams against the
   // plan's global per-pool total and retires the uuid when all declared pools
   // complete; header-declared (legacy) mode counts this push's parallelism
-  // from num_streams and retires the uuid when all constructor layers
+  // from num_streams and retires the uuid when all constructor major units
   // complete.
-  const int l =
+  const int major_dimension_idx =
       (local_id == lib::kUnspecifiedLocalId) ? 0 : static_cast<int>(local_id);
   const bool plan_declared = pool_progress_spec.has_value();
   const size_t expected_chunks =
@@ -743,8 +766,9 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   bool resolve_senders = false;
   if (!plan_declared) {
     absl::MutexLock lock(mu_);
-    auto it = layer_progress_.find(l);
-    if (it != layer_progress_.end() && it->second.expected_senders_resolved) {
+    auto it = major_dimension_progress_.find(major_dimension_idx);
+    if (it != major_dimension_progress_.end() &&
+        it->second.expected_senders_resolved) {
       expected_senders = it->second.expected_senders;
     } else {
       resolve_senders = true;
@@ -757,7 +781,7 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   bool trigger_completion = false;
   {
     absl::MutexLock lock(mu_);
-    auto& progress = layer_progress_[l];
+    auto& progress = major_dimension_progress_[major_dimension_idx];
     // A receive plan assembled from several senders completes a block array
     // only when every declared sender's streams for it have landed. The plan's
     // sender count is fixed for the life of the uuid, so it is resolved on the
@@ -787,29 +811,32 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
       }
       if (plan_pushes > expected_chunks) {
         return absl::AlreadyExistsError(
-            absl::StrCat("pool ", l, " received more than ", expected_chunks,
-                         " pushes for UUID ", uuid_));
+            absl::StrCat("pool ", major_dimension_idx, " received more than ",
+                         expected_chunks, " pushes for UUID ", uuid_));
       }
       array_complete = plan_pushes == expected_chunks;
     } else if (is_peregrine) {
       const size_t senders = expected_senders.value_or(1);
       if (senders == 0) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "block array ", l, " expected 0 senders for UUID ", uuid_));
+        return absl::InvalidArgumentError(
+            absl::StrCat("block array ", major_dimension_idx,
+                         " expected 0 senders for UUID ", uuid_));
       }
       auto& streams = progress.sender_streams[remote_id];
       if (progress.sender_streams.size() > senders) {
         return absl::AlreadyExistsError(
-            absl::StrCat("block array ", l, " received pushes from more than ",
-                         senders, " senders for UUID ", uuid_));
+            absl::StrCat("block array ", major_dimension_idx,
+                         " received pushes from more than ", senders,
+                         " senders for UUID ", uuid_));
       }
       const size_t pushes =
           AccumulateLandedShards(streams, landed_shards, full_shards);
       if (streams.landed > 1 ||
           (streams.landed == 1 && streams.landed_shards > 0)) {
-        return absl::AlreadyExistsError(absl::StrCat(
-            "block array ", l, " received more than one push from sender ",
-            remote_id, " for UUID ", uuid_));
+        return absl::AlreadyExistsError(
+            absl::StrCat("block array ", major_dimension_idx,
+                         " received more than one push from sender ", remote_id,
+                         " for UUID ", uuid_));
       }
       if (pushes > 0 && streams.landed == pushes) {
         ++progress.senders_complete;
@@ -820,42 +847,43 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
       if (streams.landed == 0) {
         if (num_streams == 0) {
           return absl::InvalidArgumentError(
-              absl::StrCat("block array ", l, " sender ", remote_id,
-                           " declared no streams for UUID ", uuid_));
+              absl::StrCat("block array ", major_dimension_idx, " sender ",
+                           remote_id, " declared no streams for UUID ", uuid_));
         }
         streams.declared = num_streams;
         if (progress.sender_streams.size() > *expected_senders) {
-          return absl::AlreadyExistsError(absl::StrCat(
-              "block array ", l, " received pushes from more than ",
-              *expected_senders, " senders for UUID ", uuid_));
+          return absl::AlreadyExistsError(
+              absl::StrCat("block array ", major_dimension_idx,
+                           " received pushes from more than ",
+                           *expected_senders, " senders for UUID ", uuid_));
         }
       } else if (streams.declared != num_streams) {
-        return absl::FailedPreconditionError(
-            absl::StrCat("block array ", l, " sender ", remote_id, " declared ",
-                         num_streams, " streams after declaring ",
-                         streams.declared, " for UUID ", uuid_));
+        return absl::FailedPreconditionError(absl::StrCat(
+            "block array ", major_dimension_idx, " sender ", remote_id,
+            " declared ", num_streams, " streams after declaring ",
+            streams.declared, " for UUID ", uuid_));
       }
       ++streams.landed;
       if (streams.landed == streams.declared) {
         ++progress.senders_complete;
       } else if (streams.landed > streams.declared) {
-        return absl::AlreadyExistsError(
-            absl::StrCat("block array ", l, " received ", streams.landed,
-                         " streams from sender ", remote_id, " which declared ",
-                         streams.declared, " for UUID ", uuid_));
+        return absl::AlreadyExistsError(absl::StrCat(
+            "block array ", major_dimension_idx, " received ", streams.landed,
+            " streams from sender ", remote_id, " which declared ",
+            streams.declared, " for UUID ", uuid_));
       }
       array_complete = progress.senders_complete == *expected_senders;
     } else {
       array_complete = progress.completed_chunks == expected_chunks;
     }
 
-    if (array_complete && !progress.on_layer_received_called) {
-      progress.on_layer_received_called = true;
+    if (array_complete && !progress.on_major_unit_completed) {
+      progress.on_major_unit_completed = true;
       trigger_completion = true;
       if (plan_declared) {
         size_t completed_pools = 0;
-        for (const auto& [pool_id, pool_progress] : layer_progress_) {
-          if (pool_progress.on_layer_received_called) {
+        for (const auto& [pool_id, pool_progress] : major_dimension_progress_) {
+          if (pool_progress.on_major_unit_completed) {
             ++completed_pools;
           }
         }
@@ -865,9 +893,9 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
       } else {
         bool all_layers_called = true;
         for (size_t layer = 0; layer < delegate_->num_layers(); ++layer) {
-          auto it = layer_progress_.find(layer);
-          if (it == layer_progress_.end() ||
-              !it->second.on_layer_received_called) {
+          auto it = major_dimension_progress_.find(layer);
+          if (it == major_dimension_progress_.end() ||
+              !it->second.on_major_unit_completed) {
             all_layers_called = false;
             break;
           }
@@ -884,9 +912,11 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
       ABSL_RETURN_IF_ERROR(session->OnDataReceived(
-          l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
+          static_cast<size_t>(major_dimension_idx),
+          /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
     } else {
-      ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(l, uuid_));
+      ABSL_RETURN_IF_ERROR(
+          delegate_->OnLayerReceived(major_dimension_idx, uuid_));
     }
   }
   return absl::OkStatus();
@@ -1036,12 +1066,12 @@ void BlockTransportServerPullSession::ResolveStepCoordinates(
     *shard = rem / local_blocks;
     *block_idx = rem % local_blocks;
   } else {
-    // block-major: shard innermost, then layer, then block_idx
-    // s = ((k * L) + l) * Sh + sh
-    *block_idx = step / (num_layers * num_shards);
-    size_t rem = step % (num_layers * num_shards);
-    *layer = rem / num_shards;
-    *shard = rem % num_shards;
+    // block-major: layer innermost, then shard, then block_idx
+    // s = ((k * Sh) + sh) * L + l
+    *block_idx = step / (num_shards * num_layers);
+    size_t rem = step % (num_shards * num_layers);
+    *shard = rem / num_layers;
+    *layer = rem % num_layers;
   }
 }
 

@@ -227,17 +227,26 @@ class BlockTransport final {
   }
 
  private:
-  // One push of |shard_ids| only, through |adapter|. `AsyncPush` calls this
-  // once per source NUMA node group and joins the futures; |num_groups| is the
-  // number of such calls, so the header declares the stream count over all of
-  // them and the receiver completes only once every group has landed.
+  // Major-order-agnostic implementation backing `AsyncPush`.
+  tsl::Future<std::vector<int>> AsyncPushInternal(
+      const std::vector<PeerEndpoint>& peers,
+      const std::vector<int>& src_minor_dimension_indices,
+      const std::vector<int>& dst_minor_dimension_indices, int parallelism,
+      MajorOrder major_order, uint64_t uuid, int major_dimension_index,
+      std::optional<int> wire_major_dimension_index);
+
+  // One push of |shard_ids| only, through |adapter|. `AsyncPushInternal` calls
+  // this once per source NUMA node group and joins the futures; |num_groups| is
+  // the number of such calls, so the header declares the stream count over all
+  // of them and the receiver completes only once every group has landed.
   tsl::Future<std::vector<int>> AsyncPushShards(
       absl::Span<const PeerEndpoint> peers,
-      const std::vector<int>& src_block_ids,
-      const std::vector<int>& dst_block_ids, int parallelism,
-      MajorOrder major_order, uint64_t uuid, int layer_idx,
-      std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
-      size_t num_groups, lib::TransportAdapter* adapter);
+      const std::vector<int>& src_minor_dimension_indices,
+      const std::vector<int>& dst_minor_dimension_indices, int parallelism,
+      MajorOrder major_order, uint64_t uuid, int major_dimension_index,
+      std::optional<int> wire_major_dimension_index,
+      absl::Span<const int> shard_ids, size_t num_groups,
+      lib::TransportAdapter* adapter);
 
   lib::Request BuildBlockRequest(
       lib::TransferOp op, uint8_t* laddr, uint8_t* raddr, size_t len,
@@ -255,11 +264,12 @@ class BlockTransport final {
   // split into several calls (one per NUMA node), 0 for `parallelism`. The
   // wire shard mask is 0 (legacy) when |shard_ids| is every shard.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
-      absl::string_view peer, const std::vector<int>& src_block_ids,
-      const std::vector<int>& dst_block_ids, MajorOrder major_order,
-      uint64_t uuid, int layer_idx, int parallelism,
-      std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
-      int total_streams = 0);
+      absl::string_view peer,
+      const std::vector<int>& src_minor_dimension_indices,
+      const std::vector<int>& dst_minor_dimension_indices,
+      MajorOrder major_order, uint64_t uuid, int major_dimension_index,
+      int parallelism, std::optional<int> wire_major_dimension_index,
+      absl::Span<const int> shard_ids, int total_streams = 0);
 
   // Adapter that sends streams reading from |numa_node|: the per-node adapter
   // when one exists, otherwise the default `transport_adapter_`.
@@ -276,8 +286,8 @@ class BlockTransport final {
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
-      const std::vector<int>& src_block_ids,
-      const std::vector<int>& allocated_ids,
+      const std::vector<int>& src_minor_dimension_indices,
+      const std::vector<int>& dst_minor_dimension_indices,
       const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
       uint64_t uuid = 0, int parallelism = 1,
       BlockReceivedCallback on_block_received = nullptr);

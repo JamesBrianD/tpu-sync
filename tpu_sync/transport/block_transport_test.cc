@@ -717,7 +717,7 @@ TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
           .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
                      /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
                      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
-                     /*layer_idx=*/0, /*wire_layer_idx=*/1)
+                     /*layer_idx=*/0, /*wire_major_dimension_index=*/1)
           .Await();
   ASSERT_TRUE(pushed.ok()) << pushed.status().message();
 
@@ -1880,6 +1880,51 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
           .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
                      /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
                      /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await());
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, MultiShardPushBlockMajorMoreLayersThanBlocks) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 2;
+  constexpr size_t kNumLayers = 4;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+
+  ABSL_ASSERT_OK(
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{0, 1},
+                     /*parallelism=*/2, MajorOrder::kBlockMajor, /*uuid=*/0,
                      /*layer_idx=*/-1)
           .Await());
 
