@@ -217,6 +217,7 @@ nanobind_extension(
     deps = [
         ":kv_cache_manager_torch",
         ":pool_layout_nanobind",
+        ":torch_host_signal_bindings",
         ":torch_nanobind_utils",
         ":torch_raw_transfer_bindings",
         ":weight_synchronizer_torch",
@@ -295,6 +296,54 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "torch_host_signal",
+    srcs = ["torch_host_signal.cc"],
+    hdrs = ["torch_host_signal.h"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-march=x86-64-v2",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_tpu_utils",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@torch_tpu//shims/torch:aten_headers",
+        "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:host_signal",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_raw_transfer_headers",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "torch_host_signal_bindings",
+    srcs = ["torch_host_signal_bindings.cc"],
+    hdrs = ["torch_host_signal_bindings.h"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-march=x86-64-v2",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_host_signal",
+        ":torch_nanobind_utils",
+        "//tpu_sync/core:host_signal",
+        "@nanobind",
+        "@torch_tpu//shims/torch:aten_headers",
     ],
     alwayslink = 1,
 )

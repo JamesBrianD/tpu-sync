@@ -40,6 +40,7 @@
 #include "tpu_sync/fault_injection/fault_injection_bindings.h"
 #include "tpu_sync/frameworks/torch/kv_cache_manager.h"
 #include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
+#include "tpu_sync/frameworks/torch/torch_host_signal_bindings.h"
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
 #include "tpu_sync/frameworks/torch/torch_raw_transfer_bindings.h"
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
@@ -1501,4 +1502,10 @@ NB_MODULE(_tpu_raiden_torch, m) {
   nb::module_ fault_injection = m.def_submodule(
       "fault_injection", "Fault and latency injection control for raiden.");
   tpu_raiden::BindFaultInjection(fault_injection);
+
+  // Device-initiated host requests for compiled programs; see
+  // tpu_sync/api/torch/host_signal.py.
+  nb::module_ host_signal = m.def_submodule(
+      "host_signal", "Device-initiated host requests over pinned host pages.");
+  ::raiden::BindTorchHostSignal(host_signal);
 }

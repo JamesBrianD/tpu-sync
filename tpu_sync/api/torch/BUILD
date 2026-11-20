@@ -75,6 +75,21 @@ py_library(
     ],
 )
 
+# Device-initiated host requests; shim for _tpu_raiden_torch.host_signal plus
+# the Pallas kernels the compiled programs run (no extra .so).
+py_library(
+    name = "host_signal",
+    srcs = ["host_signal.py"],
+    tags = ["nobuilder"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_abi",
+        ":torch_tpu_common_loader",
+        "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+        "//tpu_sync/kernels:host_signal",
+    ],
+)
+
 py_library(
     name = "kv_cache_manager_host_py",
     srcs = ["kv_cache_manager.py"],

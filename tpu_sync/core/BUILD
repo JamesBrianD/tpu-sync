@@ -373,6 +373,38 @@ cc_library(
 )
 
 cc_library(
+    name = "host_signal",
+    srcs = ["host_signal.cc"],
+    hdrs = ["host_signal.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "host_signal_test",
+    srcs = ["host_signal_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":host_signal",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "raw_dma_pacer",
     srcs = ["raw_dma_pacer.cc"],
     hdrs = ["raw_dma_pacer.h"],

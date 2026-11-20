@@ -101,6 +101,9 @@ TORCH_DEPS = [
     "//tpu_sync/api/torch:raw_transfer",
     # Fault/latency injection shim; submodule of _tpu_raiden_torch (no extra .so).
     "//tpu_sync/api/torch:fault_injection",
+    # Device-initiated host requests; submodule of _tpu_raiden_torch plus
+    # pure-JAX Pallas kernels (no extra .so).
+    "//tpu_sync/api/torch:host_signal",
     "//tpu_sync/api/torch:reshard_client",
     "//tpu_sync/api/torch:reshard_store",
     "//tpu_sync/api/torch:weight_synchronizer_torch_py",
