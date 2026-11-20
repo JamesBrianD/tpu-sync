@@ -41,6 +41,10 @@
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/core/controller/controller_client.h"
+#include "tpu_sync/core/controller/raiden_controller.h"
+#include "tpu_sync/core/controller/test_util.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
 #include "tpu_sync/kv_cache/reshard/pool_reshard_planner.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
@@ -111,6 +115,10 @@ class FakeTransport final : public ControlPipeClient {
         worker_req.ParseFromString(envelope.payload()) &&
         worker_req.command() ==
             tpu_sync::rpc::ControlRequest::COMMAND_CANCEL_TRANSFER) {
+      if (worker_req.cancel_transfer_request().is_sender()) {
+        absl::MutexLock lock(mu_);
+        sender_cancel_addrs_.insert(std::string(endpoint));
+      }
       return AnswerCancel(std::string(endpoint), envelope.request_id(),
                           worker_req.cancel_transfer_request().uuid());
     }
@@ -215,7 +223,7 @@ class FakeTransport final : public ControlPipeClient {
   }
   // Every cancel sent to `addr` fails.
   void FailCancelFor(const std::string& addr) { cancel_fail_addr_ = addr; }
-  // Calls to `addr`, cancels aside, never reach it.
+  // Calls to `addr` never reach it.
   void MakeUnreachable(const std::string& addr) { unreachable_addr_ = addr; }
 
   // Plan uuids of the cancels sent to `addr`.
@@ -242,6 +250,8 @@ class FakeTransport final : public ControlPipeClient {
   // Reply returned for an endpoint instead of a bare success.
   std::map<std::string, tpu_sync::rpc::ControlResponse> replies_;
   std::vector<std::pair<std::string, int64_t>> cancel_calls_;
+  // Addresses that were asked to cancel a send.
+  std::set<std::string> sender_cancel_addrs_;
   std::map<std::string, int> in_flight_;
   std::string cancel_fail_addr_;
   std::string unreachable_addr_;
@@ -262,6 +272,10 @@ class FakeTransport final : public ControlPipeClient {
         reply.set_cancel_settled(in_flight == 0);
         if (in_flight > 0) --in_flight;
       }
+    }
+    if (unreachable_addr_ == endpoint) {
+      return MarkControlPipeNotSent(
+          absl::DeadlineExceededError("injected connect deadline"));
     }
     control_pipe::proto::ControlResponseEnvelope resp_env;
     resp_env.set_request_id(request_id);
@@ -2565,6 +2579,36 @@ TEST_F(ReshardStackTest,
             std::vector<int>{ProtoStatus::STATUS_REGISTERED});
 }
 
+TEST_F(ReshardStackTest, CancelClaimCancelsOnlyWithNoOtherOwnerLeft) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-claim-cancel", 107, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-claim-cancel", 107, 1024, 5, 1, 0, 1024);
+
+  // Claim owners are compared by address; the values are irrelevant.
+  const int owner_a = 0;
+  const int owner_b = 0;
+  ABSL_ASSERT_OK(service_->registry()->LookupAndClaim(
+      "req-claim-cancel", 107, {Unit(0), Unit(1)}, &owner_a));
+  ABSL_ASSERT_OK(service_->registry()->LookupAndClaim(
+      "req-claim-cancel", 107, {Unit(0), Unit(1)}, &owner_b));
+
+  // Another coordination still holds the claim.
+  EXPECT_FALSE(
+      service_->registry()->CancelClaim("req-claim-cancel", 107, &owner_b));
+  EXPECT_EQ(RequestBlockStatuses("req-claim-cancel", 107),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+
+  // The last owner cancels the request.
+  EXPECT_TRUE(
+      service_->registry()->CancelClaim("req-claim-cancel", 107, &owner_a));
+  EXPECT_EQ(RequestBlockStatuses("req-claim-cancel", 107),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+  EXPECT_FALSE(
+      service_->registry()->CancelClaim("req-claim-cancel", 107, &owner_a));
+}
+
 TEST_F(ReshardStackTest, CompletionNoOpsAndPreClaimGuard) {
   using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
   RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
@@ -2889,6 +2933,29 @@ TEST_F(ReshardStackTest, FailedTransferIsNotReleasedWithoutTheFlag) {
   EXPECT_TRUE(transport_.cancel_calls_.empty());
 }
 
+TEST_F(ReshardStackTest, SenderFailureCancelsNothingWithoutTheFlag) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-off-send", 109, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-off-send", 109, 1024, 5, 1, 0, 512);
+
+  // Sender 0 fails to start.
+  tpu_sync::rpc::ControlResponse sender_failure;
+  sender_failure.set_success(false);
+  sender_failure.set_message("injected sender failure");
+  transport_.replies_["10.0.0.1:9100"] = sender_failure;
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-off-send", 109, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_FALSE(resp.transfer_released());
+  // No receiver or sender is cancelled, and the claim stays.
+  EXPECT_TRUE(transport_.cancel_calls_.empty());
+  EXPECT_EQ(RequestBlockStatuses("req-rb-off-send", 109),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
 TEST_F(ReshardRollbackTest, FailureBeforeAnyPrepareIsReleased) {
   RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
                    /*num_blocks=*/16);
@@ -2994,12 +3061,13 @@ TEST_F(ReshardRollbackTest, SenderFailureCancelsTheReceivers) {
   RegisterSpans(0, "req-rb-send", 100, 1024, 3, 0, 0, 1024);
   RegisterSpans(1, "req-rb-send", 100, 1024, 5, 1, 0, 512);
 
-  // Sender 0 fails to start. The receiver has a push from sender 1 in flight
-  // when it is first cancelled.
+  // Sender 0 fails to start. Sender 1 started: it and the receiver have a
+  // push in flight when they are first cancelled.
   tpu_sync::rpc::ControlResponse sender_failure;
   sender_failure.set_success(false);
   sender_failure.set_message("injected sender failure");
   transport_.replies_["10.0.0.1:9100"] = sender_failure;
+  transport_.KeepInFlight("10.0.0.1:9102", 1);
   transport_.KeepInFlight("10.0.0.2:9600", 1);
 
   tpu_sync::rpc::ControllerResponse resp =
@@ -3008,14 +3076,146 @@ TEST_F(ReshardRollbackTest, SenderFailureCancelsTheReceivers) {
   EXPECT_THAT(resp.message(), HasSubstr("injected sender failure"));
   EXPECT_TRUE(resp.transfer_released());
 
-  // The receiver was asked again until the push had ended. Senders are not
-  // cancelled and the claim stays, as without the flag.
+  // The receiver and the started sender were cancelled and asked again until
+  // their push had ended. Sender 0 refused the start, so it is not cancelled.
   EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9600"),
             (std::vector<int64_t>{100, 100}));
   EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9100").empty());
-  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9102").empty());
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.1:9102"),
+            (std::vector<int64_t>{100, 100}));
+  EXPECT_EQ(transport_.sender_cancel_addrs_,
+            (std::set<std::string>{"10.0.0.1:9102"}));
+  // Every sender stopped, so the claim is cancelled and a stopped sender's
+  // completion vote is a no-op.
   EXPECT_EQ(RequestBlockStatuses("req-rb-send", 100),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+  tpu_sync::rpc::ControllerResponse vote =
+      CompleteRequestBlocks("req-rb-send", 100, /*rank=*/1);
+  ASSERT_TRUE(vote.success()) << vote.message();
+  EXPECT_EQ(vote.response_data(), "0");
+}
+
+TEST_F(ReshardRollbackTest, ClaimStaysWhileASenderIsStillCopying) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-copying", 102, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-copying", 102, 1024, 5, 1, 0, 512);
+
+  // Sender 0 fails to start; sender 1 never stops within the rollback timeout.
+  tpu_sync::rpc::ControlResponse sender_failure;
+  sender_failure.set_success(false);
+  sender_failure.set_message("injected sender failure");
+  transport_.replies_["10.0.0.1:9100"] = sender_failure;
+  transport_.KeepInFlight("10.0.0.1:9102", -1);
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-copying", 102, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_TRUE(resp.transfer_released());
+  EXPECT_GT(transport_.CancelsTo("10.0.0.1:9102").size(), 1u);
+  EXPECT_EQ(RequestBlockStatuses("req-rb-copying", 102),
             std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
+TEST_F(ReshardRollbackTest, SenderTheStartNeverReachedIsNotCancelled) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-unstarted", 105, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-unstarted", 105, 1024, 5, 1, 0, 512);
+
+  // Sender 0 cannot be reached, so its start was never sent. Sender 1 started.
+  transport_.MakeUnreachable("10.0.0.1:9100");
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-unstarted", 105, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_TRUE(resp.transfer_released());
+
+  // Only the started sender is asked to stop, and the claim is cancelled.
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9100").empty());
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.1:9102"), std::vector<int64_t>{105});
+  EXPECT_EQ(RequestBlockStatuses("req-rb-unstarted", 105),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+}
+
+TEST_F(ReshardRollbackTest, SecondCoordinationLeavesTheFirstOnesSender) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-twice-send", 106, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-twice-send", 106, 1024, 5, 1, 0, 512);
+
+  // The first coordination succeeds and keeps its claim.
+  ASSERT_TRUE(Coordinate("req-rb-twice-send", 106, 2, {7, 9}).success());
+
+  // Coordinated again: sender 0 refuses (the first send is still there).
+  tpu_sync::rpc::ControlResponse refusal;
+  refusal.set_success(false);
+  refusal.set_message("pool reshard send UUID already active: 106");
+  transport_.replies_["10.0.0.1:9100"] = refusal;
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-twice-send", 106, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+
+  // The first transfer's sender is left alone. The sender this coordination
+  // started is stopped.
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9100").empty());
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.1:9102"), std::vector<int64_t>{106});
+  // The first coordination's claim stays.
+  EXPECT_EQ(RequestBlockStatuses("req-rb-twice-send", 106),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
+TEST_F(ReshardRollbackTest, ControllerModeLeavesARefusedSenderAlone) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  // Senders are started through a controller. worker_0 has no transfer
+  // manager, so it refuses a start. worker_1 is not registered, so its start
+  // gets no answer from a worker.
+  std::unique_ptr<controller::TestWorkerServer> worker =
+      controller::CreateTestWorkerServer();
+  tpu_sync::rpc::RaidenIdProto controller_unit;
+  controller_unit.set_job_name("prefill");
+  controller_unit.set_job_replica_id("0");
+  controller_unit.set_data_name("kv_cache");
+  auto raiden_controller = controller::RaidenController::Create(
+      controller_unit, /*num_blocks=*/1, /*num_shards=*/1,
+      /*shard_size_bytes=*/512, /*raiden_controller_address=*/"",
+      /*preprovision_worker_buffers=*/false);
+  ABSL_ASSERT_OK(raiden_controller);
+  ABSL_ASSERT_OK(core::controller::RaidenControllerClient(
+                     (*raiden_controller)->controller_address())
+                     .RegisterWorker(
+                         "worker_0", worker->server_address,
+                         {RaidenTransferEndpoint{worker->server_address, {}}}));
+
+  ReshardService::Options options;
+  options.port = 0;
+  options.client = &transport_;
+  options.clock = [this]() { return now_; };
+  options.delivery.mode = WorkerDelivery::Mode::kController;
+  options.delivery.controller = raiden_controller->get();
+  service_ = std::make_unique<ReshardService>(options);
+  // The service borrows the controller, so it goes first.
+  absl::Cleanup drop_service = [this]() { service_.reset(); };
+
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-controller", 108, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-controller", 108, 1024, 5, 1, 0, 512);
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-controller", 108, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("Transfer manager is not initialized"));
+  EXPECT_TRUE(resp.transfer_released());
+
+  // The sender that refused is not cancelled. The one without an answer is
+  // asked to stop, and the claim is cancelled.
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9100").empty());
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.1:9102"), std::vector<int64_t>{108});
+  EXPECT_EQ(RequestBlockStatuses("req-rb-controller", 108),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
 }
 
 TEST_F(ReshardRollbackTest, ReceiverStillInFlightIsNotReleased) {

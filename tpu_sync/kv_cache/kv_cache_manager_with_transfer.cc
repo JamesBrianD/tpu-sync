@@ -765,6 +765,13 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
                                plan));
   {
     absl::MutexLock lock(mu_);
+    // The cancel can arrive before a delayed start, or while it is set up.
+    if (auto it = cancelled_pool_reshard_sends_.find(plan.uuid());
+        it != cancelled_pool_reshard_sends_.end() &&
+        std::chrono::steady_clock::now() < it->second) {
+      return absl::CancelledError(
+          absl::StrCat("pool reshard send UUID was cancelled: ", plan.uuid()));
+    }
     sessions_[plan.uuid()] =
         SessionEntry{state, plan.req_id(), SessionRole::kPoolReshardSend};
     NoteSubPlanRegisteredLocked(plan.req_id(), state, plan.sub_plan_index(),
@@ -862,6 +869,27 @@ bool KVCacheManagerWithTransfer::CancelPoolReshardRecv(uint64_t uuid) {
   }
   session->Finish(absl::CancelledError(
       "pool reshard receive cancelled by the coordinator"));
+  return session->Done();
+}
+
+bool KVCacheManagerWithTransfer::CancelPoolReshardSend(uint64_t uuid) {
+  std::shared_ptr<TransferSession> session;
+  {
+    absl::MutexLock lock(mu_);
+    // Remember the cancel, so a running or late start for |uuid| is dropped.
+    const auto now = std::chrono::steady_clock::now();
+    absl::erase_if(cancelled_pool_reshard_sends_,
+                   [now](const auto& entry) { return entry.second <= now; });
+    cancelled_pool_reshard_sends_[uuid] = DeadlineFromNow();
+    auto it = sessions_.find(uuid);
+    if (it == sessions_.end() ||
+        it->second.role != SessionRole::kPoolReshardSend) {
+      return true;
+    }
+    session = it->second.session;
+  }
+  session->Finish(
+      absl::CancelledError("pool reshard send cancelled by the coordinator"));
   return session->Done();
 }
 

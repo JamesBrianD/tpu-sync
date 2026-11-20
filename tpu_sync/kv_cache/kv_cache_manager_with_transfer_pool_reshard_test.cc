@@ -919,6 +919,10 @@ TEST(PoolReshardRecvTest, CancelFreesTheStagingOfAnIdleReceive) {
       manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
 
+  // A send cancel finds no send and leaves the receive alone.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/3004));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+
   // No push arrived, so the cancel frees the staging at once.
   EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/3004));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
@@ -1026,6 +1030,41 @@ TEST(PoolReshardRecvTest, PrepareThatArrivesAfterItsCancelIsRefused) {
   EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6002));
 }
 
+TEST(PoolReshardSendTest, CancelStopsAnIdleSend) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(ValidPlan(/*uuid=*/6101),
+                                            std::vector<int64_t>{0}));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.GetSession(/*uuid=*/6101));
+  ASSERT_FALSE(session->Done());
+
+  // A receive cancel finds no receive and leaves the send alone.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6101));
+  EXPECT_FALSE(session->Done());
+
+  // No copy or push is in flight, so the cancel stops the send at once.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/6101));
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(), StatusIs(absl::StatusCode::kCancelled));
+}
+
+TEST(PoolReshardSendTest, StartThatArrivesAfterItsCancelIsRefused) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  // The cancel overtakes the start: nothing is there yet.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/6102));
+
+  // The late start is refused and leaves no send.
+  EXPECT_THAT(manager.PoolReshardPush(ValidPlan(/*uuid=*/6102),
+                                      std::vector<int64_t>{0}),
+              StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(manager.GetSession(/*uuid=*/6102),
+              StatusIs(absl::StatusCode::kNotFound));
+}
 
 // ---------------------------------------------------------------------------
 // Sub-plan chains: a request coordinated as several pool-reshard plans

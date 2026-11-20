@@ -255,6 +255,11 @@ class KVCacheManagerWithTransfer {
   // for |uuid| that is running or arrives later is refused.
   virtual bool CancelPoolReshardRecv(uint64_t uuid);
 
+  // Cancels the send started for plan |uuid|. Returns true when nothing of it
+  // is still running, false while a copy or push is in flight. A start for
+  // |uuid| that is running or arrives later is refused.
+  virtual bool CancelPoolReshardSend(uint64_t uuid);
+
   virtual absl::Status WaitForPendingWork();
 
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
@@ -353,6 +358,10 @@ class KVCacheManagerWithTransfer {
   // True while a cancel of |uuid| is remembered.
   bool PoolReshardRecvCancelledLocked(uint64_t uuid)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Cancelled sends, each with the time until which its start is refused.
+  absl::flat_hash_map<uint64_t, std::chrono::steady_clock::time_point>
+      cancelled_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 

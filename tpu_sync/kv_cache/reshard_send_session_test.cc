@@ -559,6 +559,39 @@ TEST(ReshardSendSessionTest,
   EXPECT_FALSE(session->plan().has_value());
 }
 
+// A manager over a FakeD2hBase, so a test can hold a copy of a send that the
+// manager started.
+class D2hTestManager : public KVCacheManagerWithTransfer {
+ public:
+  D2hTestManager()
+      : KVCacheManagerWithTransfer(std::make_unique<FakeD2hBase>(
+            /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+            /*local_port=*/std::nullopt,
+            /*host_blocks_to_allocate=*/std::make_optional(4))) {}
+
+  FakeD2hBase& fake() { return static_cast<FakeD2hBase&>(*base_); }
+};
+
+TEST(ReshardSendSessionTest, CancelPoolReshardSendWaitsForACopyInFlight) {
+  D2hTestManager manager;
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  manager.fake().HoldNextCopy(/*pool_idx=*/0);
+  ABSL_ASSERT_OK(manager.PoolReshardPush(
+      ValidPlan(/*uuid=*/1501, /*dtype_tags=*/{""}), std::vector<int64_t>{0}));
+  ASSERT_TRUE(manager.fake().WaitForCopies(/*pool_idx=*/0, /*count=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> session,
+                          manager.GetSession(/*uuid=*/1501));
+
+  // A copy is in flight: the send is cancelled, but not stopped yet.
+  EXPECT_FALSE(manager.CancelPoolReshardSend(/*uuid=*/1501));
+  EXPECT_FALSE(session->Done());
+
+  // The copy ends, and with it the send.
+  manager.fake().CompleteCopy(/*pool_idx=*/0);
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/1501));
+}
+
 TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
   ScopedDataConnReuseEnv env(/*value=*/nullptr);
   FakeD2hBase sender(/*num_layers=*/1, /*num_shards=*/1,
